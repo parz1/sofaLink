@@ -13,28 +13,50 @@ impl Worker {
         let json = serde_json::to_string(request).map_err(|e| e.to_string())?;
         // Temporary output allocation is owned even when discovery fails or is cancelled.
         self.probe_client_owned = true;
-        let (ok, reply) = self.adb(
-            &[
-                "shell",
-                "content",
-                "call",
-                "--uri",
-                "content://dev.livingroom.streamlab.capabilities",
-                "--method",
-                "media",
-                "--arg",
-                &format!("'{json}'"),
-            ],
-            Some(token),
-        )?;
-        let json = reply
-            .trim()
-            .strip_prefix("Result: Bundle[{capabilities=")
-            .and_then(|s| s.strip_suffix("}]"))
-            .filter(|_| ok)
-            .ok_or("客户端能力合同不兼容，请更新 APK")?;
-        let client: DeviceCapabilities =
-            serde_json::from_str(json).map_err(|e| format!("Invalid client capabilities: {e}"))?;
+        let client: DeviceCapabilities = if let Some(remote) = self.config.remote.clone() {
+            let id = self.session(token);
+            remote.publish(crate::remote::RemoteAction::Probe {
+                id: id.clone(),
+                request: request.clone(),
+            });
+            let deadline = Instant::now() + Duration::from_secs(8);
+            loop {
+                if let Some(error) = remote.probe_error(&id) {
+                    return Err(format!("电视能力探测失败：{error}"));
+                }
+                if let Some(caps) = remote.capabilities(&id) {
+                    break caps;
+                }
+                if !self.active(token) || Instant::now() >= deadline {
+                    return Err("电视能力探测超时或取消".into());
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        } else {
+            let (ok, reply) = self.adb(
+                &[
+                    "shell",
+                    "content",
+                    "call",
+                    "--uri",
+                    "content://dev.livingroom.streamlab.capabilities",
+                    "--method",
+                    "media",
+                    "--arg",
+                    &format!("'{json}'"),
+                ],
+                Some(token),
+            )?;
+            let json = reply
+                .trim()
+                .strip_prefix("Result: Bundle[{capabilities=")
+                .and_then(|s| s.strip_suffix("}]"))
+                .filter(|_| ok)
+                .ok_or("客户端能力合同不兼容，请更新 APK")?;
+            let client: DeviceCapabilities = serde_json::from_str(json)
+                .map_err(|e| format!("Invalid client capabilities: {e}"))?;
+            client
+        };
         let directory = self.config.root.join("local/sessions");
         std::fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
         let prefix = directory.join(format!("{}-probe", self.session(token)));

@@ -5,6 +5,7 @@
 ```text
 apps/
   tui/                     终端应用与呈现
+  host/                    Windows 用户会话主机服务与局域网控制入口
 crates/
   core/                    共享契约、状态机、Runtime 与 Backend 接口
   simulator/               模拟后端、场景与无界面验收
@@ -27,6 +28,7 @@ start.ps1                  默认 Rust TUI 入口
 
 ```text
 apps/tui ───────→ crates/core
+apps/host ──────→ crates/core / crates/emulator / crates/input
      └─────────→ crates/simulator ─────→ crates/core
      └─────────→ crates/emulator ──────→ crates/core
                        └─────────────→ crates/input ─────→ crates/core

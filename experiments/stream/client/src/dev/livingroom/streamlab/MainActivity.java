@@ -166,6 +166,7 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
 
     public void onCreate(Bundle saved) {
         super.onCreate(saved);
+        if(getIntent().getBooleanExtra("managed",false) && !getIntent().getStringExtra("sessionId").equals(HostControl.get(this).desiredStart)){finish();return;}
         sessionFormat=new SessionFormat(getIntent());
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_FULLSCREEN|View.SYSTEM_UI_FLAG_HIDE_NAVIGATION|View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY);
@@ -199,6 +200,7 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
             surface.getHolder().addCallback(this);
         }
         status=new TextView(this); status.setTextColor(Color.WHITE); status.setTextSize(17);
+        if(getIntent().getBooleanExtra("managed",false))status.setVisibility(View.GONE);
         status.setBackgroundColor(0xB0000000); status.setPadding(24,16,24,16);
         status.setText("sofaLink Stream Lab\n等待电脑发送 "+sessionFormat.label()+" 视频…");
         FrameLayout.LayoutParams overlay=new FrameLayout.LayoutParams(-2,-2,Gravity.TOP|Gravity.LEFT);
@@ -222,18 +224,36 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
         int inputPort=getIntent().getIntExtra("inputPort",0);
         if(inputPort>0 && getIntent().getStringExtra("inputKey")!=null)input=new InputSender(getIntent().getStringExtra("host"),inputPort,getIntent().getStringExtra("sessionId"),getIntent().getStringExtra("inputKey"));
         if(getIntent().getBooleanExtra("diagnostics",false))clockSync=new ClockSync(getIntent().getStringExtra("host"),getIntent().getStringExtra("sessionId"));
-        receiver.start(); android.view.Choreographer.getInstance().postFrameCallback(presentationVsync); renderProgress.clear(); ui.post(tick);
+        receiver.start();
+        if(getIntent().getBooleanExtra("managed",false))HostControl.get(this).player(this,true);
+        android.view.Choreographer.getInstance().postFrameCallback(presentationVsync); renderProgress.clear(); ui.post(tick);
     }
     public void surfaceChanged(SurfaceHolder h,int format,int width,int height) {}
     public void surfaceDestroyed(SurfaceHolder h) { stopReceiver(); }
-    public void onStop() { android.view.Choreographer.getInstance().removeFrameCallback(presentationVsync); stopReceiver(); super.onStop(); }
+    public void onStop() {
+        if(getIntent().getBooleanExtra("managed",false) && HostControl.get(this).clientRunning)HostControl.get(this).stop();
+        android.view.Choreographer.getInstance().removeFrameCallback(presentationVsync); stopReceiver(); super.onStop();
+    }
+    void endManagedStream(){if(getIntent().getBooleanExtra("managed",false)){stopReceiver();HostControl.get(this).player=new java.lang.ref.WeakReference<>(null);finish();}}
     public void onResume() {
         super.onResume();
         if(receiver==null && videoSurface!=null && videoSurface.getHolder().getSurface().isValid()) surfaceCreated(videoSurface.getHolder());
         if(receiver==null && textureSurface!=null && textureSurface.isAvailable() && textureOutput!=null) startReceiver(textureOutput);
     }
-    private void stopReceiver() {android.view.Choreographer.getInstance().removeFrameCallback(presentationVsync);ui.removeCallbacks(tick);if(clockSync!=null){clockSync.close();clockSync=null;}if(input!=null){input.close();input=null;}if(inputView!=null)inputView.releasePointerCapture();if(receiver!=null){receiver.close();receiver=null;}if(audio!=null){audio.close();audio=null;}}
+    private void stopReceiver() {if(getIntent().getBooleanExtra("managed",false) && HostControl.get(this).player.get()==this)HostControl.get(this).running(false);android.view.Choreographer.getInstance().removeFrameCallback(presentationVsync);ui.removeCallbacks(tick);if(clockSync!=null){clockSync.close();clockSync=null;}if(input!=null){input.close();input=null;}if(inputView!=null)inputView.releasePointerCapture();if(receiver!=null){receiver.close();receiver=null;}if(audio!=null){audio.close();audio=null;}}
     public boolean onKeyDown(int code,KeyEvent event) {
+        if(getIntent().getBooleanExtra("managed",false)){
+            if(code==KeyEvent.KEYCODE_BACK && event.getRepeatCount()>0){HostControl.get(this).stop();return true;}
+            if(code==KeyEvent.KEYCODE_MENU && event.getRepeatCount()==0){
+                HostControl control=HostControl.get(this);JSONObject snapshot=control.snapshot;
+                ArrayList<String> labels=new ArrayList<>();ArrayList<JSONObject> actions=new ArrayList<>();labels.add("继续游玩");actions.add(null);
+                JSONArray commands=snapshot==null?null:snapshot.optJSONArray("available_commands");
+                if(commands!=null)for(int i=0;i<commands.length();i++){JSONObject command=commands.optJSONObject(i);if(command==null)continue;
+                    String name=command.optString("command");if("stop".equals(name)||"recover".equals(name)){labels.add("stop".equals(name)?"结束会话":"恢复连接");actions.add(command);}
+                }
+                new android.app.AlertDialog.Builder(this).setTitle("sofaLink 会话").setItems(labels.toArray(new String[0]),(dialog,which)->{if(actions.get(which)!=null)control.command(actions.get(which));}).show();return true;
+            }
+        }
         if(code==KeyEvent.KEYCODE_BACK && input!=null && event.getRepeatCount()>0){input.release();finish();return true;}
         if(code==KeyEvent.KEYCODE_MENU) {
             if(status!=null && event.getRepeatCount()==0)status.setVisibility(status.getVisibility()==View.VISIBLE?View.GONE:View.VISIBLE); return true;

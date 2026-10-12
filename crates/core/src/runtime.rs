@@ -3,6 +3,9 @@ use crate::{Command, CommandError, Core, Effect, Event, Snapshot, TimeMs, Timeou
 /// A backend starts/cancels effects without blocking and reports evidence via poll.
 /// On a new generation it must cancel obsolete work before confirming cleanup.
 pub trait Backend {
+    fn application_target(&self) -> crate::ApplicationTarget {
+        crate::ApplicationTarget::Desktop
+    }
     fn stream_request(&self) -> crate::StreamRequest {
         crate::StreamRequest::default()
     }
@@ -22,7 +25,9 @@ impl<B: Backend> Runtime<B> {
     }
     pub fn with_timeouts(backend: B, timeouts: Timeouts) -> Self {
         Self {
-            core: Core::with_timeouts(timeouts).with_stream_request(backend.stream_request()),
+            core: Core::with_timeouts(timeouts)
+                .with_stream_request(backend.stream_request())
+                .with_application_target(backend.application_target()),
             backend,
         }
     }
@@ -32,7 +37,8 @@ impl<B: Backend> Runtime<B> {
     pub fn with_host_mute(backend: B, timeouts: Timeouts, enabled: bool) -> Self {
         Self {
             core: Core::with_host_mute(timeouts, enabled)
-                .with_stream_request(backend.stream_request()),
+                .with_stream_request(backend.stream_request())
+                .with_application_target(backend.application_target()),
             backend,
         }
     }

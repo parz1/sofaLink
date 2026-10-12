@@ -1,10 +1,10 @@
 # sofaLink
 
-游戏串流当前入口：`./start.ps1 -SteamBigPicture`，打开 Steam 大屏幕并运行实际桌面/系统声音串流，模拟器方向键/确认回传到 Windows。键鼠输入状态独立显示，断线释放已按住的键。操作与支持范围见 [输入回传](crates/input/README.md)。
+电视端入口已接入 Windows 主机服务：电脑运行 `./host.ps1`，首次在电视 sofaLink 应用输入电脑地址和配对码，以后从电视选择“开始游戏”进入 Steam 大屏幕，通过菜单结束会话。操作、边界与实机记录见 [电视控制闭环](docs/tv-host-control-2026-10-12.md)。电脑端 TUI 入口 `./start.ps1 -SteamBigPicture` 保留用于开发诊断。键鼠输入状态独立显示，断线释放已按住的键；支持范围见 [输入回传](crates/input/README.md)。
 
 把电脑游戏带到电视上的串流项目。先完成从电视一键进入 Steam 大屏幕、游玩和退出的完整闭环，再考虑其他游戏入口与独立媒体能力。
 
-**第一个 milestone：电视端一键进入 PC 的 Steam 大屏幕，选择并游玩游戏，结束游戏后退出大屏幕与串流，恢复电脑状态，回到电视启动页。** 首次配对后日常操作从电视发起；Windows 已开机、Steam 已安装并登录。当前仍需电脑端启动，电视发起控制与完整游戏闭环尚未完成；验收标准见 [开发路线](docs/roadmap.md)。
+**第一个 milestone：电视端一键进入 PC 的 Steam 大屏幕，选择并游玩游戏，结束游戏后退出大屏幕与串流，恢复电脑状态，回到电视启动页。** 首次配对后日常操作从电视发起；Windows 已开机、主机服务运行、Steam 已安装并登录。电视启动/结束和实际遥控器键鼠回传已验证，原生手柄、固定游戏持续游玩与游戏退出仍待验收；标准见 [开发路线](docs/roadmap.md)。
 
 当前开发范围为 Windows。主线采用 Rust core、状态模拟器与 Ratatui TUI；未来 TypeScript 桌面版共用同一个 core。Android TV 后端已连接现有 GStreamer 主机与自写客户端，支持模拟器与真实 Fire TV；Rust 媒体引擎迁移留待后续。
 

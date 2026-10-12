@@ -205,6 +205,9 @@ pub fn render(frame: &mut Frame, snapshot: &Snapshot, context: &ViewContext<'_>)
         media[1],
     );
     let mut details = vec![];
+    if snapshot.application.target != ApplicationTarget::Desktop {
+        details.push(Line::from(snapshot.application.message.clone()));
+    }
     if snapshot.host_audio.enabled {
         details.push(Line::from(snapshot.host_audio.message.clone()).fg(
             if snapshot.host_audio.status == HostAudioStatus::Error {
