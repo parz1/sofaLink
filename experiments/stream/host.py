@@ -41,12 +41,16 @@ def main():
     parser.add_argument("--vbv-frames", type=int, default=1,
                         help="rate-control capacity in frame budgets; does not add a raw video queue")
     parser.add_argument("--test-pattern", action="store_true")
+    parser.add_argument("--monitor-handle", type=lambda v: int(v, 0), default=0,
+                        help="explicit HMONITOR selected by the Windows display adapter; no primary-screen fallback")
     parser.add_argument("--color-profile", choices=("sdr709", "goldfish-compat"), default="sdr709",
                         help="SDR BT.709 matrix; goldfish-compat is calibrated only for the TV emulator")
     parser.add_argument("--transport", choices=("tcp","udp"), default="tcp")
     parser.add_argument("--no-audio", action="store_true")
     parser.add_argument("--test-tone", action="store_true")
     parser.add_argument("--audio-exclude-pid", type=int, default=0)
+    parser.add_argument("--audio-include-pid", type=int, default=0,
+                        help="capture only this process tree, without changing the default audio endpoint")
     parser.add_argument("--audio-device", help="WASAPI render endpoint ID for device loopback (e.g. Steam Streaming Speakers)")
     parser.add_argument("--session-id", default="experiment")
     parser.add_argument("--control-stdin", action="store_true")
@@ -54,6 +58,12 @@ def main():
     parser.add_argument("--seconds", type=int, default=0, help="0: until Ctrl+C")
     parser.add_argument("--log", default=str(ROOT / "local/stream-host.jsonl"))
     args = parser.parse_args()
+    if args.monitor_handle < 0 or (args.monitor_handle and args.test_pattern):
+        parser.error("monitor-handle requires desktop capture and a positive native handle")
+    if args.audio_include_pid and (args.audio_exclude_pid or args.audio_device or args.test_tone or args.no_audio):
+        parser.error("audio-include-pid requires process loopback without other audio source overrides")
+    if not 0 <= args.audio_include_pid <= 0xffffffff:
+        parser.error("invalid audio-include-pid")
     if (args.gop_size != -1 and not 1 <= args.gop_size <= 600) or not 1 <= args.vbv_frames <= 8:
         parser.error("gop-size must be -1 (on-demand refresh) or 1..600; vbv-frames must be 1..8")
     if args.audio_device and (args.audio_exclude_pid or args.test_tone or args.no_audio):
@@ -61,6 +71,10 @@ def main():
     if not 1 <= args.port <= 65535 or not 1000 <= args.bitrate <= 100000 or args.seconds < 0 or not 0 <= args.audio_exclude_pid <= 0xffffffff:
         parser.error("invalid port, bitrate or duration")
     Gst.init(None)
+    monitor = None
+    if args.monitor_handle:
+        from capture_target import monitor_bounds
+        monitor = monitor_bounds(args.monitor_handle)
     if not 160 <= args.width <= 4096 or not 160 <= args.height <= 4096 or args.width%2 or args.height%2 or not 1 <= args.fps <= 240:
         parser.error("invalid video mode")
     for name in ("nvd3d11h264enc", "d3d11convert", "rtph264pay", "udpsink"):
@@ -87,10 +101,17 @@ def main():
         audio_source = f"audiotestsrc is-live=true samplesperbuffer={args.audio_rate//100} volume=0.02 wave=sine" if args.test_tone else "wasapi2src name=capture_audio loopback=true low-latency=true provide-clock=false slave-method=re-timestamp loopback-silence-on-device-mute=false"
         if not args.test_tone and args.audio_exclude_pid:
             audio_source += f" loopback-mode=exclude-process-tree loopback-target-pid={args.audio_exclude_pid}"
+        if args.audio_include_pid:
+            audio_source += f" loopback-mode=include-process-tree loopback-target-pid={args.audio_include_pid}"
         description += (f" {audio_source} ! audioconvert ! audioresample "
             f"! audio/x-raw,format=S16LE,rate={args.audio_rate},channels=2,layout=interleaved "
             "! appsink name=pcm emit-signals=true max-buffers=2 drop=true sync=false")
     pipeline = Gst.parse_launch(description)
+    if args.monitor_handle:
+        capture = pipeline.get_by_name("capture")
+        if not capture.find_property("monitor-handle"):
+            raise RuntimeError("Capture adapter does not support explicit monitor selection")
+        capture.set_property("monitor-handle", args.monitor_handle)
     if args.audio_device:
         pipeline.get_by_name("capture_audio").set_property("device", args.audio_device)
     pipeline.use_clock(Gst.SystemClock.obtain())
@@ -295,6 +316,7 @@ def main():
     emit({"type": "configuration", "pipeline": description, "width": args.width, "height": args.height, "fps": args.fps,"audioRate":args.audio_rate,"audio":bool(audio),
           "color_profile":args.color_profile,"colorimetry":colorimetry,"encoder_preset":args.encoder_preset,"audio_device":args.audio_device,
           "encoder_profile":args.encoder_profile,"gop_size":args.gop_size,"vbv_frames":args.vbv_frames,
+          "monitor":monitor,"audio_include_pid":args.audio_include_pid,
           "encoder_frames_columns":["index", "encoded_pts_ns", "bytes", "keyframe"],
           "diagnostics":args.diagnostics,
           "latency_scope": "encoder input->encoded output; client first packet->Surface callback; neither is glass-to-glass"})
