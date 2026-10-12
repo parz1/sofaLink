@@ -37,6 +37,7 @@ unsafe extern "system" {
     fn GetForegroundWindow() -> isize;
     fn SetForegroundWindow(window: isize) -> i32;
     fn IsWindow(window: isize) -> i32;
+    fn GetWindowThreadProcessId(window: isize, process: *mut u32) -> u32;
 }
 #[link(name = "bcrypt")]
 unsafe extern "system" {
@@ -115,4 +116,13 @@ pub fn focus(target: Option<isize>) -> Result<(), String> {
         }
     }
     Ok(())
+}
+pub fn window_exists(window: isize, owner: u32) -> bool {
+    let mut process = 0;
+    // SAFETY: OS validates the opaque handle and writes to an aligned local u32.
+    unsafe {
+        IsWindow(window) != 0
+            && GetWindowThreadProcessId(window, &mut process) != 0
+            && process == owner
+    }
 }

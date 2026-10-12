@@ -8,6 +8,12 @@ pub enum AppBackend {
     Emulator(EmulatorBackend),
 }
 impl Backend for AppBackend {
+    fn application_target(&self) -> ApplicationTarget {
+        match self {
+            Self::Simulated(b) => b.application_target(),
+            Self::Emulator(b) => b.application_target(),
+        }
+    }
     fn stream_request(&self) -> StreamRequest {
         match self {
             Self::Simulated(b) => b.stream_request(),

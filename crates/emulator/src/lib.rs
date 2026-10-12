@@ -1,5 +1,7 @@
 //! Windows Android TV backend. Device I/O stays on a worker, outside core/UI.
 mod media_adapter;
+pub mod remote;
+mod steam;
 mod telemetry;
 use sofalink_core::*;
 use std::{
@@ -22,6 +24,8 @@ const PACKAGE: &str = "dev.livingroom.streamlab";
 
 #[derive(Clone)]
 pub struct Config {
+    pub remote: Option<remote::RemoteBridge>,
+    pub steam_big_picture: bool,
     pub reference_video: bool,
     pub presentation_mode_override: Option<String>,
     pub stream_request: StreamRequest,
@@ -67,6 +71,8 @@ impl Config {
             None
         };
         Ok(Self {
+            remote: None,
+            steam_big_picture: false,
             stream_request: StreamRequest::default(),
             reference_video: false,
             presentation_mode_override: None,
@@ -147,6 +153,7 @@ enum Work {
     Shutdown,
 }
 pub struct EmulatorBackend {
+    application_target: ApplicationTarget,
     request: StreamRequest,
     pub serial: String,
     tx: Sender<Work>,
@@ -169,6 +176,11 @@ impl EmulatorBackend {
             return Err("模拟器兼容适配器暂时只验证了默认请求；非默认参数请用真实设备".into());
         }
         let request = config.stream_request.clone();
+        let application_target = if config.steam_big_picture {
+            ApplicationTarget::SteamBigPicture
+        } else {
+            ApplicationTarget::Desktop
+        };
         let serial = config.serial.clone();
         if !cfg!(windows) {
             return Err("Android TV backend currently requires Windows".into());
@@ -200,9 +212,12 @@ impl EmulatorBackend {
             audio_session: None,
             mute_session: None,
             media_plan: None,
+            steam_window: None,
+            steam_window_owner: None,
         };
         let handle = thread::spawn(move || worker.run());
         Ok(Self {
+            application_target,
             serial,
             request,
             tx,
@@ -214,6 +229,9 @@ impl EmulatorBackend {
     }
 }
 impl Backend for EmulatorBackend {
+    fn application_target(&self) -> ApplicationTarget {
+        self.application_target
+    }
     fn stream_request(&self) -> StreamRequest {
         self.request.clone()
     }
@@ -276,6 +294,8 @@ struct Worker {
     audio_session: Option<String>,
     mute_session: Option<String>,
     media_plan: Option<MediaPlan>,
+    steam_window: Option<isize>,
+    steam_window_owner: Option<u32>,
 }
 impl Worker {
     fn audio_route(&self, action: &str, session: &str) -> Result<(), String> {
@@ -391,13 +411,29 @@ impl Worker {
                 self.latest.lock().expect("media lock").take();
                 self.emit(token, EventKind::HostExited);
             }
-            if self.client_owned && !self.client_missing && Instant::now() >= self.next_client_check
-            {
+            if Instant::now() >= self.next_client_check {
                 self.next_client_check = Instant::now() + Duration::from_secs(1);
                 let token = *self.current.lock().expect("token lock");
-                if let Ok((false, pid)) = self.adb(&["shell", "pidof", PACKAGE], Some(token))
-                    && pid.trim().is_empty()
+                if let (Some(window), Some(owner)) = (self.steam_window, self.steam_window_owner)
+                    && !sofalink_input::window_exists(window, owner)
                 {
+                    self.emit(
+                        token,
+                        EventKind::Application(ApplicationState {
+                            target: ApplicationTarget::SteamBigPicture,
+                            status: ApplicationStatus::Inactive,
+                            message: "Steam 大屏幕窗口已退出".into(),
+                        }),
+                    );
+                }
+                let missing = self.client_owned
+                    && !self.client_missing
+                    && if let Some(remote) = &self.config.remote {
+                        !remote.running(&self.session(token))
+                    } else {
+                        matches!(self.adb(&["shell","pidof",PACKAGE],Some(token)),Ok((false,pid)) if pid.trim().is_empty())
+                    };
+                if missing {
                     self.client_missing = true;
                     if let Some(mut input) = self.input.take() {
                         let _ = input.shutdown();
@@ -438,6 +474,9 @@ impl Worker {
         }
     }
     fn confirm_tv(&self, token: Option<Token>) -> Result<(), String> {
+        if self.config.remote.is_some() {
+            return Ok(());
+        }
         if self.config.fire_tv {
             let (ok, manufacturer) =
                 self.adb(&["shell", "getprop", "ro.product.manufacturer"], token)?;
@@ -458,6 +497,27 @@ impl Worker {
         Ok(())
     }
     fn client_start(&mut self, token: Token, session: &str) -> Result<(), String> {
+        if let Some(remote) = self.config.remote.clone() {
+            let plan = self.media_plan.as_ref().ok_or("Media plan missing")?;
+            let request = &plan.request;
+            let input = self.input.as_ref().ok_or("Input server unavailable")?;
+            let extras = serde_json::json!({"host":self.config.host_ip,"transport":"tcp","audioBackend":"auto","presentationMode":"vsync","syncVideo":true,"diagnostics":self.config.diagnostics,"videoQueueFrames":4,"decoder":plan.decoder,"videoWidth":request.video.width,"videoHeight":request.video.height,"videoFps":request.video.fps,"audioRate":request.audio.sample_rate,"requireLowLatencyAudio":request.require_low_latency_audio,"sessionId":session,"inputPort":input.port,"inputKey":input.key,"managed":true});
+            self.client_owned = true;
+            self.client_missing = false;
+            remote.publish(remote::RemoteAction::Start {
+                session: session.into(),
+                extras,
+            });
+            let deadline = Instant::now() + Duration::from_secs(8);
+            while !remote.running(session) {
+                if !self.active(token) || Instant::now() >= deadline {
+                    return Err("电视未确认播放器启动".into());
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            self.next_client_check = Instant::now() + Duration::from_secs(1);
+            return Ok(());
+        }
         if !self.active(token) {
             return Err("操作已取消".into());
         }
@@ -605,6 +665,9 @@ impl Worker {
         }
         if !self.active(token) {
             return Err("操作已取消".into());
+        }
+        if self.config.steam_big_picture {
+            self.start_steam(token)?;
         }
         let events = self.events.clone();
         let current = self.current.clone();
@@ -803,6 +866,7 @@ impl Worker {
     fn cleanup(&mut self, token: Option<Token>) -> Result<(bool, bool), String> {
         let mute = self.restore_host_mute();
         let media = self.cleanup_media(token);
+        let steam = self.stop_steam(token);
         // Restore even when device cleanup fails. Never report complete cleanup
         // while an owned audio route has not been released.
         if let Some(session) = self.audio_session.as_ref() {
@@ -810,6 +874,7 @@ impl Worker {
             self.audio_session = None;
         }
         mute?;
+        steam?;
         media
     }
     fn restore_host_mute(&mut self) -> Result<(), String> {
@@ -847,6 +912,42 @@ impl Worker {
         }
         self.latest.lock().expect("media lock").take();
         if !self.client_owned && !self.probe_client_owned {
+            return Ok((true, true));
+        }
+        if let Some(remote) = self.config.remote.clone() {
+            let session = match remote.action() {
+                Some(remote::RemoteAction::Probe { id, .. }) => {
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while !remote.probe_finished(&id) {
+                        if Instant::now() >= deadline {
+                            return Ok((true, false));
+                        }
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                    self.client_owned = false;
+                    self.probe_client_owned = false;
+                    return Ok((true, true));
+                }
+                Some(remote::RemoteAction::Start { session, .. })
+                | Some(remote::RemoteAction::Stop { session }) => session,
+                _ => {
+                    self.client_owned = false;
+                    self.probe_client_owned = false;
+                    return Ok((true, true));
+                }
+            };
+            remote.publish(remote::RemoteAction::Stop {
+                session: session.clone(),
+            });
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !remote.stopped(&session) {
+                if Instant::now() >= deadline {
+                    return Ok((true, false));
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            self.client_owned = false;
+            self.probe_client_owned = false;
             return Ok((true, true));
         }
         // The AVD identity check also prevents cleaning up an unrelated emulator.
@@ -924,15 +1025,20 @@ impl Worker {
                 if self.config.mute_host {
                     self.audio_control("audio-mute.ps1", "Recover", &session)?;
                 }
-                self.confirm_tv(Some(token))?;
-                let (ok, boot) =
-                    self.adb(&["shell", "getprop", "sys.boot_completed"], Some(token))?;
-                if !ok || boot.trim() != "1" {
-                    return Err("Android TV 设备尚未启动完成".into());
+                if self.config.steam_big_picture {
+                    self.recover_steam(token)?;
                 }
-                let (ok, apk) = self.adb(&["shell", "pm", "path", PACKAGE], Some(token))?;
-                if !ok || !apk.contains("package:") {
-                    return Err("请先安装实验客户端".into());
+                if self.config.remote.is_none() {
+                    self.confirm_tv(Some(token))?;
+                    let (ok, boot) =
+                        self.adb(&["shell", "getprop", "sys.boot_completed"], Some(token))?;
+                    if !ok || boot.trim() != "1" {
+                        return Err("Android TV 设备尚未启动完成".into());
+                    }
+                    let (ok, apk) = self.adb(&["shell", "pm", "path", PACKAGE], Some(token))?;
+                    if !ok || !apk.contains("package:") {
+                        return Err("请先安装实验客户端".into());
+                    }
                 }
                 let negotiation = if self.config.fire_tv {
                     let result = self.probe_media(token)?;
@@ -1044,6 +1150,7 @@ mod tests {
             },
         ))));
         let mut backend = EmulatorBackend {
+            application_target: ApplicationTarget::Desktop,
             request: StreamRequest::default(),
             serial: SERIAL.into(),
             tx,

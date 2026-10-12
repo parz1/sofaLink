@@ -140,6 +140,29 @@ pub struct InputServer {
     worker: Option<JoinHandle<Result<(), String>>>,
     shutdown_error: Option<String>,
 }
+
+/// OS-generated credential shared by control/input adapters, never by core.
+pub fn random_secret() -> Result<String, String> {
+    #[cfg(windows)]
+    {
+        windows::secret()
+    }
+    #[cfg(not(windows))]
+    {
+        Err("Windows random provider unavailable".into())
+    }
+}
+pub fn window_exists(window: isize, owner: u32) -> bool {
+    #[cfg(windows)]
+    {
+        windows::window_exists(window, owner)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (window, owner);
+        false
+    }
+}
 impl InputServer {
     pub fn start(
         session: String,

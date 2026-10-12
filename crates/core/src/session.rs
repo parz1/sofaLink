@@ -50,6 +50,7 @@ impl Default for Core {
                 audio: SignalState::Stopped,
                 host_audio: HostAudioState::default(),
                 input: InputState::default(),
+                application: ApplicationState::default(),
                 performance: PerformanceState::default(),
                 stream_request: StreamRequest::default(),
                 media_negotiation: None,
@@ -73,6 +74,10 @@ impl Default for Core {
 }
 
 impl Core {
+    pub fn with_application_target(mut self, target: ApplicationTarget) -> Self {
+        self.state.application.target = target;
+        self
+    }
     pub fn with_timeouts(timeouts: Timeouts) -> Self {
         Self {
             timeouts,
@@ -183,6 +188,10 @@ impl Core {
     }
 
     fn start(&mut self, now: TimeMs) {
+        if self.state.application.target == ApplicationTarget::SteamBigPicture {
+            self.state.application.status = ApplicationStatus::Inactive;
+            self.state.application.message = "等待进入 Steam 大屏幕".into();
+        }
         self.state.media_negotiation = None;
         self.state.token = Token {
             session: self.state.token.session + 1,
@@ -233,6 +242,36 @@ impl Core {
         self.clock = now;
         let mut effects = vec![];
         match (self.state.phase, event.kind) {
+            (
+                Phase::StartingClient | Phase::WaitingMedia | Phase::Playing | Phase::Degraded,
+                EventKind::Application(application),
+            ) if application.target == self.state.application.target
+                && application.target != ApplicationTarget::Desktop
+                && application.status == ApplicationStatus::Inactive =>
+            {
+                self.state.application = application;
+                self.begin_cleanup(now, None);
+                effects.push(self.effect(EffectKind::Cleanup));
+            }
+            (phase, EventKind::Application(application))
+                if application.target == self.state.application.target
+                    && ((matches!(phase, Phase::StartingHost | Phase::Recovering)
+                        && matches!(
+                            application.status,
+                            ApplicationStatus::Starting
+                                | ApplicationStatus::Ready
+                                | ApplicationStatus::Inactive
+                        ))
+                        || (phase == Phase::Stopping
+                            && matches!(
+                                application.status,
+                                ApplicationStatus::Stopping
+                                    | ApplicationStatus::Inactive
+                                    | ApplicationStatus::Error
+                            ))) =>
+            {
+                self.state.application = application;
+            }
             (phase @ (Phase::Checking | Phase::Recovering), EventKind::Negotiated(result)) => {
                 match negotiate_media(&self.state.stream_request, &result.host, &result.client) {
                     Ok(plan) if plan == result.plan => {
@@ -352,7 +391,10 @@ impl Core {
                 self.set_phase(Phase::StartingHost, "准备捕获、编码与声音");
                 effects.push(self.effect(EffectKind::StartHost));
             }
-            (Phase::StartingHost, EventKind::HostReady) => {
+            (Phase::StartingHost, EventKind::HostReady)
+                if self.state.application.target == ApplicationTarget::Desktop
+                    || self.state.application.status == ApplicationStatus::Ready =>
+            {
                 self.state.resources.host = ResourceState::Running;
                 self.state.resources.client = ResourceState::Starting;
                 self.set_phase(Phase::StartingClient, "启动客户端");
@@ -362,7 +404,10 @@ impl Core {
                 self.state.resources.client = ResourceState::Running;
                 self.set_phase(Phase::WaitingMedia, "等待实际音画播放进度");
             }
-            (Phase::Recovering, EventKind::Recovered) => {
+            (Phase::Recovering, EventKind::Recovered)
+                if self.state.application.target == ApplicationTarget::Desktop
+                    || self.state.application.status == ApplicationStatus::Ready =>
+            {
                 if self.state.host_audio.enabled {
                     self.state.host_audio.status = HostAudioStatus::Original;
                     self.state.host_audio.message = "已恢复电脑原静音状态，等待电视播放".into();
@@ -429,6 +474,9 @@ impl Core {
                     client_stopped,
                 },
             ) => {
+                let host_stopped = host_stopped
+                    && (self.state.application.target == ApplicationTarget::Desktop
+                        || self.state.application.status == ApplicationStatus::Inactive);
                 self.state.resources.host = if host_stopped {
                     ResourceState::Stopped
                 } else {
@@ -440,7 +488,10 @@ impl Core {
                     ResourceState::Unknown
                 };
                 self.deadline = None;
-                if self.state.resources.clear() {
+                if self.state.resources.clear()
+                    && (self.state.application.target == ApplicationTarget::Desktop
+                        || self.state.application.status == ApplicationStatus::Inactive)
+                {
                     if self.state.host_audio.enabled {
                         self.state.host_audio.status = HostAudioStatus::Original;
                         self.state.host_audio.message = "已恢复电脑原静音状态".into();

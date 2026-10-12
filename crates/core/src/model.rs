@@ -190,6 +190,8 @@ pub struct Snapshot {
     #[serde(default)]
     pub input: InputState,
     #[serde(default)]
+    pub application: ApplicationState,
+    #[serde(default)]
     pub performance: crate::PerformanceState,
     #[serde(default)]
     pub stream_request: crate::StreamRequest,
@@ -231,6 +233,7 @@ pub struct Effect {
 
 #[derive(Clone, Debug)]
 pub enum EventKind {
+    Application(ApplicationState),
     Checked,
     Negotiated(crate::MediaNegotiation),
     HostReady,
@@ -276,4 +279,28 @@ pub struct HostAudioState {
 pub struct Event {
     pub token: Token,
     pub kind: EventKind,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApplicationTarget {
+    #[default]
+    Desktop,
+    SteamBigPicture,
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApplicationStatus {
+    #[default]
+    Inactive,
+    Starting,
+    Ready,
+    Stopping,
+    Error,
+}
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApplicationState {
+    pub target: ApplicationTarget,
+    pub status: ApplicationStatus,
+    pub message: String,
 }

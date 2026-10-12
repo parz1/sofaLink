@@ -16,6 +16,7 @@ try {
         'sofalink-input' = @('sofalink-core')
         'sofalink-emulator' = @('sofalink-core','sofalink-input')
         'sofalink-tui' = @('sofalink-core', 'sofalink-simulator', 'sofalink-emulator')
+        'sofalink-host' = @('sofalink-core','sofalink-emulator','sofalink-input')
     }
     $workspaceNames = @($metadata.packages.name)
     foreach ($package in $metadata.packages) {
