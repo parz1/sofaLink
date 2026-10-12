@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "codec": "avc",
+  "video": {"width": 1920, "height": 1080, "fps": 60},
+  "bitrate_kbit": 20000,
+  "color": "sdr709",
+  "audio": {"sample_rate": 48000, "channels": 2, "sample_format": "pcm_s16_le"},
+  "require_low_latency_audio": true
+}
