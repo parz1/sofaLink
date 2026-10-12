@@ -747,6 +747,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "sofalink-desktop"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "sofalink-core",
+ "sofalink-input",
+]
+
+[[package]]
 name = "sofalink-emulator"
 version = "0.1.0"
 dependencies = [

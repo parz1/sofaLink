@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/core", "crates/simulator", "crates/input", "crates/emulator", "apps/tui", "apps/host"]
+members = ["crates/core", "crates/simulator", "crates/input", "crates/emulator", "apps/tui", "apps/host", "apps/desktop"]
 default-members = ["apps/tui"]
 resolver = "3"
 

@@ -1,5 +1,7 @@
 //! Independent reliable input channel. Only the Windows adapter knows OS APIs.
 #[cfg(windows)]
+pub mod focus_adapter;
+#[cfg(windows)]
 mod windows;
 use serde::Deserialize;
 use sofalink_core::{InputState, InputStatus};

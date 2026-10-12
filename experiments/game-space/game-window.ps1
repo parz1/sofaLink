@@ -21,7 +21,15 @@ $window=$game.MainWindowHandle
 $rect=[SofaGameWindow+Rect]::new()
 if(![SofaGameWindow]::GetWindowRect($window,[ref]$rect)){throw 'Cannot query game window'}
 if($Action -eq 'Move'){
-    if(Test-Path -LiteralPath $leaseFile){throw 'Existing game window lease; restore before moving again'}
+    if(Test-Path -LiteralPath $leaseFile){
+        $previous=Get-Content -LiteralPath $leaseFile -Raw | ConvertFrom-Json
+        $previousProcess=Get-Process -Id $previous.pid -ErrorAction SilentlyContinue
+        $sameProcess=$previousProcess -and $previousProcess.StartTime.ToUniversalTime().Ticks -eq ([DateTime]$previous.process_start).ToUniversalTime().Ticks
+        if($sameProcess){throw 'Existing live game window lease; restore before moving again'}
+        # The old process exited. Archive its record; never restore geometry onto the new game.
+        $archive=Join-Path $root "local/game-space/expired-window-lease-$([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()).json"
+        Move-Item -LiteralPath $leaseFile -Destination $archive
+    }
     if($MonitorHandle -le 0){throw 'Explicit monitor handle required'}
     $monitor=[SofaGameWindow+MonitorInfo]::new();$monitor.size=[Runtime.InteropServices.Marshal]::SizeOf($monitor)
     if(![SofaGameWindow]::GetMonitorInfo([IntPtr]$MonitorHandle,[ref]$monitor)){throw 'Target monitor unavailable'}

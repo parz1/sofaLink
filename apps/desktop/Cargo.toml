@@ -1,0 +1,13 @@
+[package]
+name = "sofalink-desktop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+sofalink-core.workspace = true
+sofalink-input.workspace = true
+serde_json.workspace = true
+
+[lints.rust]
+unsafe_code = "deny"
