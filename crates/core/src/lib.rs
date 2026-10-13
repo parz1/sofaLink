@@ -1,6 +1,7 @@
 //! Shared state contract and session control, independent of any backend or UI.
 mod encoding;
 mod focus;
+mod game_space;
 mod media;
 mod model;
 mod performance;
@@ -10,6 +11,7 @@ mod session;
 
 pub use encoding::*;
 pub use focus::*;
+pub use game_space::*;
 pub use media::*;
 pub use model::*;
 pub use performance::*;

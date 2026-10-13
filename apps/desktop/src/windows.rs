@@ -1,5 +1,6 @@
 //! Windows-only adapter and native view. All focus policy lives in FocusCore.
 #![allow(unsafe_code)]
+use crate::space_backend::{Config as SpaceConfig, SpaceBackend};
 use sofalink_core::*;
 use sofalink_input::focus_adapter::{
     activate, activate_in_space, alive, foreground, game_window, identity, in_space, move_to_space,
@@ -120,6 +121,36 @@ unsafe extern "system" {
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn GetModuleHandleW(name: *const u16) -> H;
+    fn CreateMutexW(attributes: *const std::ffi::c_void, owner: i32, name: *const u16) -> H;
+    fn GetLastError() -> u32;
+    fn CloseHandle(handle: H) -> i32;
+}
+struct ManagerLock(H);
+impl Drop for ManagerLock {
+    fn drop(&mut self) {
+        unsafe {
+            CloseHandle(self.0);
+        }
+    }
+}
+fn manager_lock() -> Result<ManagerLock, String> {
+    let handle = unsafe {
+        CreateMutexW(
+            std::ptr::null(),
+            0,
+            wide("Global\\sofaLink-DisplayManager").as_ptr(),
+        )
+    };
+    if handle == 0 {
+        return Err("无法取得虚拟屏幕管理锁，可能有其他会话正在使用".into());
+    }
+    if unsafe { GetLastError() } == 183 {
+        unsafe {
+            CloseHandle(handle);
+        }
+        return Err("sofaLink 桌面管理已在运行".into());
+    }
+    Ok(ManagerLock(handle))
 }
 #[link(name = "gdi32")]
 unsafe extern "system" {
@@ -155,6 +186,16 @@ static BRUSH: AtomicIsize = AtomicIsize::new(0);
 thread_local! {static APP:RefCell<Option<App>>=const {RefCell::new(None)};}
 
 struct App {
+    manager: Option<Manager>,
+    session_status: H,
+    session_button: H,
+    settings_button: H,
+    uninstall_button: H,
+    settings_info: H,
+    settings: bool,
+    shown_space_revision: u64,
+    controls_revision: u64,
+    shown_settings: bool,
     monitor: Option<u64>,
     space: H,
     move_game: H,
@@ -171,6 +212,89 @@ struct App {
     evidence: std::fs::File,
     shortcuts: bool,
 }
+struct Manager {
+    core: GameSpaceCore,
+    backend: SpaceBackend,
+    closing: bool,
+    work_before_start: Option<WindowRef>,
+    session_request: Option<u64>,
+}
+fn space_command(command: SpaceCommand) {
+    APP.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let app = slot.as_mut().unwrap();
+        let work = work_candidate(foreground(), app.core.snapshot().game);
+        if let Some(manager) = app.manager.as_mut() {
+            if command == SpaceCommand::Start {
+                manager.work_before_start = work;
+            }
+            if let Ok(Some(effect)) = manager.core.command(command) {
+                manager.backend.execute(effect);
+            }
+        }
+    });
+    render();
+}
+fn pump_space() {
+    let close = APP.with(|slot| {
+        let Ok(mut slot) = slot.try_borrow_mut() else {
+            return false;
+        };
+        let Some(app) = slot.as_mut() else {
+            return false;
+        };
+        let Some(manager) = app.manager.as_mut() else {
+            return false;
+        };
+        for event in manager.backend.poll() {
+            if manager.core.snapshot().pending != Some(event.effect) {
+                continue;
+            }
+            if event.effect.operation == SpaceOperation::StartMedia
+                && event.error.is_none()
+                && let Some(binding) = event.binding
+            {
+                app.monitor = Some(binding.monitor);
+                manager.session_request = Some(event.effect.request);
+                app.core
+                    .attach_with_work(binding.game, manager.work_before_start);
+            }
+            if let Some(effect) = manager
+                .core
+                .complete(event.effect, event.resources, event.error)
+            {
+                manager.backend.execute(effect);
+            }
+        }
+        for request in manager.backend.lost_sessions() {
+            if manager.session_request == Some(request)
+                && let Some(effect) = manager
+                    .core
+                    .lost("电视音视频或媒体进程已中断，正在恢复并回收".into())
+            {
+                manager.backend.execute(effect);
+            }
+        }
+        if manager.core.snapshot().phase == SpacePhase::Streaming
+            && app.core.snapshot().game.is_none()
+            && let Some(effect) = manager.core.lost("游戏窗口已失效，正在恢复并回收".into())
+        {
+            manager.backend.execute(effect);
+        }
+        if manager.closing && manager.core.snapshot().pending.is_none() {
+            if manager.core.snapshot().resources.clear() {
+                return true;
+            }
+            manager.closing = false;
+        }
+        false
+    });
+    if close {
+        unsafe {
+            DestroyWindow(WINDOW.load(Ordering::Relaxed));
+        }
+    }
+}
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
 }
@@ -181,6 +305,7 @@ fn text(window: H, s: &str) {
 }
 
 fn observe() {
+    pump_space();
     APP.with(|slot| {
         let Ok(mut slot) = slot.try_borrow_mut() else {
             return;
@@ -211,6 +336,18 @@ fn observe() {
 }
 fn command(command: FocusCommand) {
     observe();
+    let allowed = APP.with(|slot| {
+        let slot = slot.borrow();
+        let app = slot.as_ref().unwrap();
+        app.manager.as_ref().is_none_or(|m| {
+            m.core
+                .allowed_focus_commands(app.core.snapshot())
+                .contains(&command)
+        })
+    });
+    if !allowed {
+        return;
+    }
     let effect = APP.with(|slot| {
         slot.borrow_mut().as_mut().and_then(|app| {
             app.core
@@ -238,6 +375,7 @@ fn command(command: FocusCommand) {
     }
 }
 fn render() {
+    render_space();
     let view = APP.with(|slot| {
         let mut slot = slot.borrow_mut();
         let app = slot.as_mut()?;
@@ -245,16 +383,19 @@ fn render() {
             return None;
         }
         let state = app.core.snapshot().clone();
-        if app.shown_revision == state.revision {
+        let space_revision=app.manager.as_ref().map_or(0,|m|m.core.snapshot().revision);
+        if app.shown_revision == state.revision && app.shown_space_revision==space_revision {
             return None;
         }
         app.shown_revision = state.revision;
+        app.shown_space_revision=space_revision;
         let _ = writeln!(
             app.evidence,
             "{}",
-            serde_json::json!({"host_uptime_ms":app.start.elapsed().as_millis(),"focus":state})
+            serde_json::json!({"host_uptime_ms":app.start.elapsed().as_millis(),"focus":state,"space":app.manager.as_ref().map(|m|m.core.snapshot())})
         );
         let _ = app.evidence.flush();
+        let managed_focus=app.manager.as_ref().map(|m|(m.core.focus_message(&state),m.core.allowed_focus_commands(&state)));
         Some((
             state,
             app.status,
@@ -266,6 +407,7 @@ fn render() {
             app.space,
             app.move_game,
             app.monitor.is_some(),
+            managed_focus,
         ))
     });
     if let Some((
@@ -279,9 +421,12 @@ fn render() {
         space,
         move_game,
         has_space,
+        managed_focus,
     )) = view
     {
-        text(status, &state.message);
+        let (message, commands) =
+            managed_focus.unwrap_or((state.message.clone(), state.available_commands.clone()));
+        text(status, &message);
         text(
             space,
             if !has_space {
@@ -319,27 +464,76 @@ fn render() {
         unsafe {
             EnableWindow(
                 take,
-                i32::from(
-                    state
-                        .available_commands
-                        .contains(&FocusCommand::TakeComputer),
-                ),
+                i32::from(commands.contains(&FocusCommand::TakeComputer)),
             );
             EnableWindow(
                 game,
-                i32::from(state.available_commands.contains(&FocusCommand::ReturnGame)),
+                i32::from(commands.contains(&FocusCommand::ReturnGame)),
             );
             EnableWindow(
                 move_game,
-                i32::from(
-                    state
-                        .available_commands
-                        .contains(&FocusCommand::MoveGameToSpace),
-                ),
+                i32::from(commands.contains(&FocusCommand::MoveGameToSpace)),
             );
             InvalidateRect(take, std::ptr::null(), 0);
             InvalidateRect(game, std::ptr::null(), 0);
             InvalidateRect(move_game, std::ptr::null(), 0);
+        }
+    }
+}
+fn render_space() {
+    let view = APP.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let app = slot.as_mut()?;
+        let m = app.manager.as_ref()?;
+        if app.session_status == 0
+            || (app.controls_revision == m.core.snapshot().revision
+                && app.shown_settings == app.settings)
+        {
+            return None;
+        }
+        app.controls_revision = m.core.snapshot().revision;
+        app.shown_settings = app.settings;
+        Some((
+            m.core.snapshot().clone(),
+            app.session_status,
+            app.session_button,
+            app.settings_button,
+            app.uninstall_button,
+            app.settings_info,
+            app.settings,
+        ))
+    });
+    if let Some((state, status, button, settings, uninstall, info, open)) = view {
+        text(status, state.issue.as_deref().unwrap_or(&state.message));
+        text(
+            button,
+            if state.available_commands.contains(&SpaceCommand::Start) {
+                "开始串流"
+            } else if state.available_commands.contains(&SpaceCommand::Recover) {
+                "恢复并回收"
+            } else if state.available_commands.contains(&SpaceCommand::Stop) {
+                "结束串流"
+            } else {
+                "正在处理…"
+            },
+        );
+        text(settings, if open { "收起设置" } else { "设置" });
+        unsafe {
+            EnableWindow(
+                button,
+                i32::from(
+                    state
+                        .available_commands
+                        .iter()
+                        .any(|c| *c != SpaceCommand::Uninstall),
+                ),
+            );
+            EnableWindow(
+                uninstall,
+                i32::from(state.available_commands.contains(&SpaceCommand::Uninstall)),
+            );
+            ShowWindow(uninstall, if open { 4 } else { 0 });
+            ShowWindow(info, if open { 4 } else { 0 });
         }
     }
 }
@@ -360,6 +554,33 @@ unsafe extern "system" fn proc(window: H, message: u32, w: usize, l: isize) -> i
                 1001 => command(FocusCommand::TakeComputer),
                 1002 => command(FocusCommand::ReturnGame),
                 1003 => command(FocusCommand::MoveGameToSpace),
+                1004 => {
+                    let command = APP.with(|slot| {
+                        slot.borrow()
+                            .as_ref()
+                            .and_then(|app| app.manager.as_ref())
+                            .and_then(|m| {
+                                m.core
+                                    .snapshot()
+                                    .available_commands
+                                    .iter()
+                                    .copied()
+                                    .find(|c| *c != SpaceCommand::Uninstall)
+                            })
+                    });
+                    if let Some(command) = command {
+                        space_command(command);
+                    }
+                }
+                1005 => {
+                    APP.with(|slot| {
+                        let mut slot = slot.borrow_mut();
+                        let app = slot.as_mut().unwrap();
+                        app.settings = !app.settings;
+                    });
+                    render_space();
+                }
+                1006 => space_command(SpaceCommand::Uninstall),
                 _ => {}
             };
             0
@@ -396,13 +617,11 @@ unsafe extern "system" fn proc(window: H, message: u32, w: usize, l: isize) -> i
                         SelectObject(item.dc, app.font);
                     }
                 });
-                let label = wide(match item.id {
-                    1001 => "拿回电脑",
-                    1002 => "返回游戏",
-                    _ => "移到电视屏幕",
-                });
+                let mut label_buffer = [0u16; 128];
+                let length = GetWindowTextW(item.window, label_buffer.as_mut_ptr(), 128);
+                let label = &label_buffer[..length.max(0) as usize];
                 let mut rect = item.rect;
-                DrawTextW(item.dc, label.as_ptr(), -1, &mut rect, 0x25);
+                DrawTextW(item.dc, label.as_ptr(), length, &mut rect, 0x25);
                 if item.state & 0x10 != 0 {
                     rect.left += 4;
                     rect.right -= 4;
@@ -414,8 +633,25 @@ unsafe extern "system" fn proc(window: H, message: u32, w: usize, l: isize) -> i
             1
         }
         0x0010 => {
-            unsafe {
-                DestroyWindow(window);
+            let wait = APP.with(|slot| {
+                let mut slot = slot.borrow_mut();
+                let app = slot.as_mut().unwrap();
+                if let Some(m) = app.manager.as_mut() {
+                    m.closing = true;
+                    if let Some(effect) = m.core.shutdown() {
+                        m.backend.execute(effect);
+                    }
+                    return !m.core.snapshot().resources.clear()
+                        || m.core.snapshot().pending.is_some();
+                }
+                false
+            });
+            if !wait {
+                unsafe {
+                    DestroyWindow(window);
+                }
+            } else {
+                render();
             }
             0
         }
@@ -445,8 +681,8 @@ pub fn run() -> Result<(), String> {
     let value = args
         .windows(2)
         .find(|a| a[0] == "--game-pid")
-        .ok_or("Use --game-pid with a running game")?[1]
-        .parse::<u32>()
+        .map(|a| a[1].parse::<u32>())
+        .transpose()
         .map_err(|e| e.to_string())?;
     let root = args
         .windows(2)
@@ -459,7 +695,12 @@ pub fn run() -> Result<(), String> {
         .map(|a| a[1].parse::<u64>())
         .transpose()
         .map_err(|e| e.to_string())?;
-    let game = game_window(value).ok_or("Game window unavailable")?;
+    let managed = args.iter().any(|a| a == "--manage-space");
+    let _lock = if managed { Some(manager_lock()?) } else { None };
+    let game = value.and_then(game_window);
+    if !managed && game.is_none() {
+        return Err("Use --game-pid with a running game".into());
+    }
     let evidence_dir = root.join("local/game-space");
     std::fs::create_dir_all(&evidence_dir).map_err(|e| e.to_string())?;
     let evidence = OpenOptions::new()
@@ -468,9 +709,47 @@ pub fn run() -> Result<(), String> {
         .open(evidence_dir.join(format!("focus-desktop-{}.jsonl", std::process::id())))
         .map_err(|e| e.to_string())?;
     let mut core = FocusCore::default();
-    core.attach(game);
+    if let Some(game) = game {
+        core.attach(game);
+    }
+    let manager = if managed {
+        let argument = |name: &str| {
+            args.windows(2)
+                .find(|a| a[0] == name)
+                .map(|a| a[1].clone())
+                .ok_or_else(|| format!("Missing {name}"))
+        };
+        let backend = SpaceBackend::new(SpaceConfig {
+            root: root.clone(),
+            shell: argument("--shell")?.into(),
+            device: argument("--device")?,
+            python: argument("--python")?.into(),
+        });
+        let mut state = GameSpaceCore::default();
+        let effect = state.initialize();
+        backend.execute(effect);
+        Some(Manager {
+            core: state,
+            backend,
+            closing: false,
+            work_before_start: None,
+            session_request: None,
+        })
+    } else {
+        None
+    };
     APP.with(|slot| {
         *slot.borrow_mut() = Some(App {
+            manager,
+            session_status: 0,
+            session_button: 0,
+            settings_button: 0,
+            uninstall_button: 0,
+            settings_info: 0,
+            settings: false,
+            shown_space_revision: 0,
+            controls_revision: u64::MAX,
+            shown_settings: false,
             monitor,
             space: 0,
             move_game: 0,
@@ -520,7 +799,7 @@ pub fn run() -> Result<(), String> {
             40,
             40,
             470,
-            330,
+            if managed { 560 } else { 330 },
             0,
             0,
             instance,
@@ -581,6 +860,42 @@ pub fn run() -> Result<(), String> {
             ShowWindow(move_game, 0);
         }
         let issue = child("STATIC", "", 0, 20, 247, 420, 48, 0);
+        if managed {
+            let session_status = child("STATIC", "", 0, 20, 301, 420, 48, 0);
+            let session_button = child("BUTTON", "开始串流", 0xb, 20, 359, 278, 44, 1004);
+            let settings_button = child("BUTTON", "设置", 0xb, 310, 359, 124, 44, 1005);
+            let settings_info = child(
+                "STATIC",
+                "正常结束会回收屏幕。彻底卸载会删除 Windows 驱动包，再次开始时需要重新安装。",
+                0,
+                20,
+                414,
+                420,
+                52,
+                0,
+            );
+            let uninstall_button = child(
+                "BUTTON",
+                "彻底卸载虚拟显示驱动",
+                0xb,
+                20,
+                475,
+                414,
+                40,
+                1006,
+            );
+            APP.with(|slot| {
+                let mut slot = slot.borrow_mut();
+                let app = slot.as_mut().unwrap();
+                app.session_status = session_status;
+                app.session_button = session_button;
+                app.settings_button = settings_button;
+                app.uninstall_button = uninstall_button;
+                app.settings_info = settings_info;
+            });
+            ShowWindow(settings_info, 0);
+            ShowWindow(uninstall_button, 0);
+        }
         let shortcut_take = RegisterHotKey(window, 1, 0x4003, 0x78) != 0;
         let shortcut_game = RegisterHotKey(window, 2, 0x4003, 0x79) != 0;
         APP.with(|slot| {
@@ -628,7 +943,15 @@ pub fn run() -> Result<(), String> {
                     slot.borrow().as_ref().unwrap().start.elapsed().as_secs() >= seconds
                 })
             }) {
-                DestroyWindow(window);
+                let closing = APP.with(|slot| {
+                    slot.borrow()
+                        .as_ref()
+                        .and_then(|a| a.manager.as_ref())
+                        .is_some_and(|m| m.closing)
+                });
+                if !closing {
+                    PostMessageW(window, 0x0010, 0, 0);
+                }
             }
         }
         UnhookWinEvent(hook);

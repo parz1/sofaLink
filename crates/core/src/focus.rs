@@ -68,6 +68,11 @@ pub struct FocusCore {
 }
 
 impl FocusCore {
+    pub fn attach_with_work(&mut self, game: WindowRef, work: Option<WindowRef>) {
+        self.attach(game);
+        self.state.work = work.filter(|w| *w != game);
+        self.publish();
+    }
     pub fn snapshot(&self) -> &FocusSnapshot {
         &self.state
     }

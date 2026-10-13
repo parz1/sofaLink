@@ -11,6 +11,7 @@ public class SofaGameWindow {
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr window,out Rect rect);
     [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr window,IntPtr after,int x,int y,int width,int height,uint flags);
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr window);
     [DllImport("user32.dll",CharSet=CharSet.Unicode)] public static extern bool GetMonitorInfo(IntPtr monitor,ref MonitorInfo info);
 }
 '@
@@ -41,8 +42,24 @@ if($Action -eq 'Move'){
 }elseif($Action -eq 'Restore'){
     $lease=Get-Content -LiteralPath $leaseFile -Raw | ConvertFrom-Json
     $sameStart=([DateTime]$lease.process_start).ToUniversalTime().Ticks -eq $game.StartTime.ToUniversalTime().Ticks
-    if($lease.pid -ne $game.Id -or $lease.window -ne $window.ToInt64() -or !$sameStart){throw 'Game identity changed; refusing to restore another process'}
-    if(![SofaGameWindow]::SetWindowPos($window,[IntPtr]::Zero,$lease.x,$lease.y,$lease.width,$lease.height,0x14)){throw 'Window restore failed'}
+    if($lease.pid -ne $game.Id -or !$sameStart){throw 'Game identity changed; refusing to restore another process'}
+    if($lease.window -ne $window.ToInt64() -and [SofaGameWindow]::IsWindow([IntPtr]$lease.window)){throw 'Original game window still exists; replacement is ambiguous'}
+    $topology=& "$PSScriptRoot/display-probe.ps1" | ConvertFrom-Json
+    $primary=@($topology.displays | Where-Object primary)
+    if($primary.Count -ne 1){throw 'Primary display not confirmed'}
+    $primary=$primary[0]
+    $width=[Math]::Min($lease.width,$primary.width);$height=[Math]::Min($lease.height,$primary.height)
+    $x=[Math]::Clamp([int]$lease.x,[int]$primary.x,[int]($primary.x+$primary.width-$width))
+    $y=[Math]::Clamp([int]$lease.y,[int]$primary.y,[int]($primary.y+$primary.height-$height))
+    if(![SofaGameWindow]::SetWindowPos($window,[IntPtr]::Zero,$x,$y,$width,$height,0x14)){throw 'Window restore failed'}
+    $stable=0
+    for($attempt=0;$attempt -lt 20;$attempt++){
+        Start-Sleep -Milliseconds 50
+        if(![SofaGameWindow]::GetWindowRect($window,[ref]$rect)){throw 'Cannot verify restored window'}
+        $inside=$rect.left -ge $primary.x -and $rect.top -ge $primary.y -and $rect.right -le ($primary.x+$primary.width) -and $rect.bottom -le ($primary.y+$primary.height)
+        $stable=if($inside){$stable+1}else{0};if($stable -ge 6){break}
+    }
+    if($stable -lt 6){throw 'Game did not remain on primary display; display lease retained'}
     Remove-Item -LiteralPath $leaseFile
 }
 if(![SofaGameWindow]::GetWindowRect($window,[ref]$rect)){throw 'Cannot verify final window position'}
